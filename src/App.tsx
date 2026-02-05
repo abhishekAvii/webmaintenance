@@ -551,7 +551,7 @@ function App() {
             <div className="bg-blue-600 p-2 rounded-lg">
               <FileText className="w-6 h-6 text-white" />
             </div>
-            <h1 className="text-xl font-bold text-slate-900">WPメンテナンス報告書ジェネレーター</h1>
+            <h1 className="text-xl font-bold text-slate-900">AVII WPメンテナンス報告</h1>
           </div>
           <div className="flex items-center gap-2">
             <Button
