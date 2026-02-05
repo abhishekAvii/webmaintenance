@@ -3,8 +3,21 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import multer from 'multer';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load .env from parent directory
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+// Debug: Log configuration (remove in production)
+console.log('📧 SMTP Configuration:');
+console.log('  Host:', process.env.SMTP_HOST);
+console.log('  Port:', process.env.SMTP_PORT);
+console.log('  User:', process.env.SMTP_USER);
+console.log('  Pass:', process.env.SMTP_PASS ? '****' + process.env.SMTP_PASS.slice(-4) : 'NOT SET');
 
 const app = express();
 const upload = multer();
