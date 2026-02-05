@@ -1,0 +1,21 @@
+{
+    "name": "wp-maintenance-email-server",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Email server for WordPress Maintenance Report Generator",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js",
+        "dev": "nodemon index.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "nodemailer": "^6.9.8",
+        "cors": "^2.8.5",
+        "multer": "^1.4.5-lts.1",
+        "dotenv": "^16.3.1"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.2"
+    }
+}

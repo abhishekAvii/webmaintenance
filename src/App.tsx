@@ -358,27 +358,186 @@ function App() {
     }
   }
 
-  const sendEmail = () => {
+
+  const sendEmail = async () => {
     if (!reportData.clientEmail) {
       toast.error('クライアントのメールアドレスを入力してください')
       return
     }
 
-    const subject = encodeURIComponent(`WordPressメンテナンス報告書 - ${format(new Date(reportData.reportDate), 'yyyy年MM月dd日')}`)
-
-    let attachmentsInfo = ''
-    if (reportData.analyticsImage) {
-      attachmentsInfo += `\n- Google Analyticsレポート画像: ${reportData.analyticsImage.name}`
-    }
-    if (reportData.clarityImage) {
-      attachmentsInfo += `\n- Microsoft Clarityレポート画像: ${reportData.clarityImage.name}`
+    if (!pdfContentRef.current) {
+      toast.error('PDFコンテンツが見つかりません')
+      return
     }
 
-    const body = encodeURIComponent(`${reportData.clientName}様\n\nWordPressメンテナンス報告書をお送りいたします。\n\n対象期間: ${reportData.periodStart} ～ ${reportData.periodEnd}${attachmentsInfo}\n\n詳細は添付のPDFをご確認ください。\n\nよろしくお願いいたします。`)
+    setIsGenerating(true)
+    try {
+      // Generate PDF first (same logic as generatePDF but return base64 instead of downloading)
+      const originalElement = pdfContentRef.current
+      const element = originalElement.cloneNode(true) as HTMLElement
 
-    window.open(`mailto:${reportData.clientEmail}?subject=${subject}&body=${body}`)
-    toast.success('メールクライアントを開きました')
+      element.style.position = 'fixed'
+      element.style.left = '-10000px'
+      element.style.top = '0'
+      element.style.zIndex = '-1000'
+      element.style.width = '190mm'
+
+      document.body.appendChild(element)
+
+      try {
+        // Pre-load logo
+        let logoDataUrl: string
+        try {
+          logoDataUrl = await getLogoDataUrl()
+        } catch (e) {
+          console.warn('Could not load logo', e)
+          logoDataUrl = ''
+        }
+
+        const logoImgs = element.querySelectorAll('img[src="/logo.png"]')
+        logoImgs.forEach((img) => {
+          if (logoDataUrl) {
+            (img as HTMLImageElement).src = logoDataUrl
+          }
+        })
+
+        // Wait for images
+        const images = element.querySelectorAll('img')
+        await Promise.all(
+          Array.from(images).map(
+            (img) =>
+              new Promise<void>((resolve) => {
+                if (img.complete && img.naturalWidth > 0) {
+                  resolve()
+                } else {
+                  img.onload = () => resolve()
+                  img.onerror = () => resolve()
+                  setTimeout(() => resolve(), 3000)
+                }
+              })
+          )
+        )
+
+        await new Promise(resolve => setTimeout(resolve, 500))
+
+        // PDF alignment fix
+        const listItems = element.querySelectorAll('.flex.items-center')
+        listItems.forEach((item) => {
+          const span = item.querySelector('span')
+          if (span) {
+            span.style.paddingTop = '2px'
+          }
+        })
+
+        // Page break logic
+        const pxPerMm = element.offsetWidth / 190
+        const pageHeightPx = 277 * pxPerMm
+        const keepElements = Array.from(element.querySelectorAll('.pdf-keep')) as HTMLElement[]
+
+        for (const child of keepElements) {
+          const elementRect = element.getBoundingClientRect()
+          const childRect = child.getBoundingClientRect()
+          const relativeTop = childRect.top - elementRect.top
+          const relativeBottom = relativeTop + childRect.height
+          const startPage = Math.floor(relativeTop / pageHeightPx)
+          const endPage = Math.floor(relativeBottom / pageHeightPx)
+
+          if (startPage !== endPage) {
+            const nextPageStart = (startPage + 1) * pageHeightPx
+            const pushDownAmount = nextPageStart - relativeTop
+            child.style.marginTop = `${pushDownAmount + 20}px`
+          }
+        }
+
+        // Capture with html2canvas
+        const canvas = await html2canvas(element, {
+          scale: 1.5,
+          useCORS: true,
+          logging: false,
+          backgroundColor: '#ffffff',
+          windowWidth: element.scrollWidth,
+          windowHeight: element.scrollHeight,
+        })
+
+        const imgData = canvas.toDataURL('image/png')
+        const pdf = new jsPDF('p', 'mm', 'a4')
+
+        const pdfWidth = pdf.internal.pageSize.getWidth()
+        const pdfHeight = pdf.internal.pageSize.getHeight()
+        const margin = 10
+        const contentWidth = pdfWidth - margin * 2
+
+        const imgWidth = canvas.width
+        const imgHeight = canvas.height
+        const ratio = contentWidth / imgWidth
+        const scaledHeight = imgHeight * ratio
+
+        let heightLeft = scaledHeight
+        let position = 0
+        let pageCount = 0
+
+        // Add pages
+        pdf.addImage(imgData, 'PNG', margin, margin, contentWidth, scaledHeight)
+        heightLeft -= (pdfHeight - margin * 2)
+        pageCount++
+
+        while (heightLeft > 0) {
+          position = heightLeft - scaledHeight + margin
+          pdf.addPage()
+          pdf.addImage(imgData, 'PNG', margin, position, contentWidth, scaledHeight)
+          heightLeft -= (pdfHeight - margin * 2)
+          pageCount++
+        }
+
+        // Add page numbers
+        for (let i = 1; i <= pageCount; i++) {
+          pdf.setPage(i)
+          pdf.setFontSize(8)
+          pdf.setTextColor(150, 150, 150)
+          pdf.text(`${i} / ${pageCount}`, pdfWidth / 2, pdfHeight - 5, { align: 'center' })
+        }
+
+        const filename = `WP_Maintenance_Report_${reportData.clientName || 'Client'}_${format(new Date(reportData.reportDate), 'yyyyMMdd')}.pdf`
+
+        // Get PDF as base64
+        const pdfBase64 = pdf.output('dataurlstring')
+
+        // Send to backend
+        const response = await fetch('http://localhost:3001/api/send-email', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            clientEmail: reportData.clientEmail,
+            clientName: reportData.clientName,
+            periodStart: reportData.periodStart,
+            periodEnd: reportData.periodEnd,
+            pdfBase64: pdfBase64,
+            fileName: filename,
+          }),
+        })
+
+        const result = await response.json()
+
+        if (result.success) {
+          toast.success('メールが正常に送信されました！')
+        } else {
+          toast.error(result.message || 'メール送信に失敗しました')
+        }
+
+      } finally {
+        document.body.removeChild(element)
+      }
+
+    } catch (error) {
+      console.error('Email sending error:', error)
+      toast.error(`メール送信中にエラーが発生しました: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    } finally {
+      setIsGenerating(false)
+    }
   }
+
 
   const completedTasksCount = reportData.tasks.filter(t => t.checked).length
   const progressPercentage = (completedTasksCount / reportData.tasks.length) * 100
@@ -408,7 +567,7 @@ function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div className={`grid gap-8 ${showPreview ? 'grid-cols-1 lg:grid-cols-2' : 'grid-cols-1'}`}>
           {/* Form Section */}
           <div className="space-y-6">
             {/* Client Info Card */}
@@ -751,223 +910,225 @@ function App() {
           </div>
 
           {/* Preview Section */}
-          <div className={`${showPreview ? 'block' : 'fixed left-[-9999px]'} sticky top-24`}>
-            <div className="bg-white rounded-lg shadow-lg overflow-hidden">
-              <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-600">レポートプレビュー</span>
-                <span className="text-xs text-slate-400">複数ページ対応</span>
-              </div>
-              <div className="overflow-auto max-h-[calc(100vh-200px)] p-4 bg-slate-100">
-                {/* PDF Content - This is what gets captured */}
-                <div
-                  ref={pdfContentRef}
-                  className="bg-white w-[190mm] mx-auto p-8 shadow-sm"
-                  style={{
-                    minHeight: 'auto',
-                    fontFamily: '"Noto Sans JP", "Hiragino Sans", "Meiryo", sans-serif'
-                  }}
-                >
-                  {/* Company Header with Logo */}
-                  <div className="flex justify-between items-center mb-6 pb-4 border-b-2 border-blue-600">
-                    <div className="flex items-center gap-4">
-                      <img
-                        src="/logo.png"
-                        alt="AVII IMAGE WORKS"
-                        className="w-16 h-16 object-contain"
-                      />
-                      <div>
-                        <h3 className="text-lg font-bold text-slate-900">AVII IMAGE WORKS</h3>
-                        <p className="text-sm text-slate-500">WordPress Maintenance Service</p>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="bg-blue-600 text-white px-4 py-2 rounded-lg">
-                        <p className="text-xs opacity-80">報告日</p>
-                        <p className="text-base font-bold">
-                          {format(new Date(reportData.reportDate), 'yyyy年MM月dd日')}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Report Title */}
-                  <div className="text-center mb-8">
-                    <h1 className="text-3xl font-bold text-slate-900 mb-2">
-                      WordPress メンテナンス報告書
-                    </h1>
-                    <p className="text-slate-500">WordPress Maintenance Report</p>
-                  </div>
-
-                  {/* Client Info */}
-                  <div className="mb-6">
-                    <h2 className="text-lg font-bold text-slate-800 mb-3">クライアント情報</h2>
-                    <div className="bg-slate-50 rounded-lg p-4">
-                      <div className="grid grid-cols-2 gap-4">
-                        <div>
-                          <p className="text-sm text-slate-500">クライアント名</p>
-                          <p className="font-medium text-slate-900">{reportData.clientName || '---'}</p>
-                        </div>
-                        <div>
-                          <p className="text-sm text-slate-500">サイトURL</p>
-                          <p className="font-medium text-slate-900">{reportData.siteUrl || '---'}</p>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Period */}
-                  <div className="mb-6 pdf-keep">
-                    <h2 className="text-lg font-bold text-slate-800 mb-3">報告期間</h2>
-                    <div className="bg-slate-50 rounded-lg p-4">
-                      <p className="text-2xl font-bold text-blue-600 text-center">
-                        {reportData.periodStart} ～ {reportData.periodEnd}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Maintenance Tasks */}
-                  <div className="mb-6">
-                    <h2 className="text-lg font-bold text-slate-800 mb-3">実施したメンテナンス</h2>
-                    <div className="grid grid-cols-2 gap-2">
-                      {reportData.tasks.map((task) => (
-                        <div
-                          key={task.id}
-                          className={`flex items-center gap-2 p-3 rounded-lg border pdf-keep ${task.checked
-                            ? 'bg-green-50 border-green-200'
-                            : 'bg-slate-50 border-slate-200 opacity-50'
-                            }`}
-                        >
-                          <div className={`w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 ${task.checked ? 'bg-green-500' : 'bg-slate-300'
-                            }`}>
-                            {task.checked && <CheckCircle2 className="w-3 h-3 text-white" />}
-                          </div>
-                          <span className={`text-sm ${task.checked ? 'text-slate-900 font-medium' : 'text-slate-400'}`}>
-                            {task.label}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Plugin Update List */}
-                  {reportData.pluginUpdateList.trim() && (
-                    <div className="mb-6">
-                      <h2 className="text-lg font-bold text-slate-800 mb-3">更新したプラグイン</h2>
-                      <div className="bg-slate-50 rounded-lg p-4">
-                        <ul className="space-y-1">
-                          {reportData.pluginUpdateList.split('\n').filter(line => line.trim()).map((plugin, index) => (
-                            <li key={index} className="flex items-center gap-2 text-sm text-slate-700 pdf-keep">
-                              <span className="w-4 h-4 rounded-full bg-green-500 flex items-center justify-center flex-shrink-0">
-                                <CheckCircle2 className="w-3 h-3 text-white" />
-                              </span>
-                              <span className="leading-none pt-[1px]">{plugin.trim()}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Backup File Name */}
-                  {reportData.backupFileName && (
-                    <div className="mb-6">
-                      <h2 className="text-lg font-bold text-slate-800 mb-3">バックアップ情報</h2>
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                        <p className="text-sm text-slate-600 mb-1">バックアップファイル名</p>
-                        <p className="text-lg font-mono font-medium text-blue-800">{reportData.backupFileName}</p>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Analytics Report */}
-                  {(reportData.analyticsSummary || reportData.analyticsImage || reportData.claritySummary || reportData.clarityImage) && (
-                    <div className="mb-6">
-                      <h2 className="text-lg font-bold text-slate-800 mb-3">解析レポート</h2>
-
-                      {/* Google Analytics */}
-                      {(reportData.analyticsSummary || reportData.analyticsImage) && (
-                        <div className="mb-4">
-                          <h3 className="text-sm font-semibold text-slate-700 mb-2">Google Analytics</h3>
-                          {reportData.analyticsImage && (
-                            <div className="border rounded-lg overflow-hidden mb-2 bg-slate-50 flex justify-center">
-                              <img
-                                src={reportData.analyticsImage.dataUrl}
-                                alt="Google Analytics"
-                                className="max-w-full object-contain"
-                                style={{ maxHeight: '400px' }}
-                              />
-                            </div>
-                          )}
-                          {reportData.analyticsSummary && (
-                            <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
-                              {reportData.analyticsSummary}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Microsoft Clarity */}
-                      {(reportData.claritySummary || reportData.clarityImage) && (
-                        <div>
-                          <h3 className="text-sm font-semibold text-slate-700 mb-2">Microsoft Clarity</h3>
-                          {reportData.clarityImage && (
-                            <div className="border rounded-lg overflow-hidden mb-2 bg-slate-50 flex justify-center">
-                              <img
-                                src={reportData.clarityImage.dataUrl}
-                                alt="Microsoft Clarity"
-                                className="max-w-full object-contain"
-                                style={{ maxHeight: '400px' }}
-                              />
-                            </div>
-                          )}
-                          {reportData.claritySummary && (
-                            <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
-                              {reportData.claritySummary}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Comments */}
-                  {reportData.comment && (
-                    <div className="mb-6">
-                      <h2 className="text-lg font-bold text-slate-800 mb-3">コメント</h2>
-                      <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
-                        {reportData.comment}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Footer */}
-                  <div className="mt-8 pt-6 border-t border-slate-200">
-                    <div className="flex justify-between items-end">
-                      <div>
-                        <p className="text-sm text-slate-500 mb-2">
-                          本報告書はWordPressメンテナンスの実施内容を報告するものです。
-                        </p>
-                        <p className="text-xs text-slate-400">
-                          Generated by WP Maintenance Report Generator
-                        </p>
-                      </div>
-                      <div className="text-right flex items-center gap-3">
-                        <div>
-                          <p className="text-sm font-bold text-slate-800">AVII IMAGE WORKS</p>
-                          <p className="text-xs text-slate-500">WordPress Maintenance Service</p>
-                        </div>
+          {showPreview && (
+            <div className="sticky top-24">
+              <div className="bg-white rounded-lg shadow-lg overflow-hidden">
+                <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                  <span className="text-sm font-medium text-slate-600">レポートプレビュー</span>
+                  <span className="text-xs text-slate-400">複数ページ対応</span>
+                </div>
+                <div className="overflow-auto max-h-[calc(100vh-200px)] p-4 bg-slate-100">
+                  {/* PDF Content - This is what gets captured */}
+                  <div
+                    ref={pdfContentRef}
+                    className="bg-white w-[190mm] mx-auto p-8 shadow-sm"
+                    style={{
+                      minHeight: 'auto',
+                      fontFamily: '"Noto Sans JP", "Hiragino Sans", "Meiryo", sans-serif'
+                    }}
+                  >
+                    {/* Company Header with Logo */}
+                    <div className="flex justify-between items-center mb-6 pb-4 border-b-2 border-blue-600">
+                      <div className="flex items-center gap-4">
                         <img
                           src="/logo.png"
                           alt="AVII IMAGE WORKS"
-                          className="w-10 h-10 object-contain"
+                          className="w-16 h-16 object-contain"
                         />
+                        <div>
+                          <h3 className="text-lg font-bold text-slate-900">AVII IMAGE WORKS</h3>
+                          <p className="text-sm text-slate-500">WordPress Maintenance Service</p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="bg-blue-600 text-white px-4 py-2 rounded-lg">
+                          <p className="text-xs opacity-80">報告日</p>
+                          <p className="text-base font-bold">
+                            {format(new Date(reportData.reportDate), 'yyyy年MM月dd日')}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Report Title */}
+                    <div className="text-center mb-8">
+                      <h1 className="text-3xl font-bold text-slate-900 mb-2">
+                        WordPress メンテナンス報告書
+                      </h1>
+                      <p className="text-slate-500">WordPress Maintenance Report</p>
+                    </div>
+
+                    {/* Client Info */}
+                    <div className="mb-6">
+                      <h2 className="text-lg font-bold text-slate-800 mb-3">クライアント情報</h2>
+                      <div className="bg-slate-50 rounded-lg p-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <p className="text-sm text-slate-500">クライアント名</p>
+                            <p className="font-medium text-slate-900">{reportData.clientName || '---'}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-slate-500">サイトURL</p>
+                            <p className="font-medium text-slate-900">{reportData.siteUrl || '---'}</p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Period */}
+                    <div className="mb-6 pdf-keep">
+                      <h2 className="text-lg font-bold text-slate-800 mb-3">報告期間</h2>
+                      <div className="bg-slate-50 rounded-lg p-4">
+                        <p className="text-2xl font-bold text-blue-600 text-center">
+                          {reportData.periodStart} ～ {reportData.periodEnd}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Maintenance Tasks */}
+                    <div className="mb-6">
+                      <h2 className="text-lg font-bold text-slate-800 mb-3">実施したメンテナンス</h2>
+                      <div className="grid grid-cols-2 gap-2">
+                        {reportData.tasks.map((task) => (
+                          <div
+                            key={task.id}
+                            className={`flex items-center gap-2 p-3 rounded-lg border pdf-keep ${task.checked
+                              ? 'bg-green-50 border-green-200'
+                              : 'bg-slate-50 border-slate-200 opacity-50'
+                              }`}
+                          >
+                            <div className={`w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 ${task.checked ? 'bg-green-500' : 'bg-slate-300'
+                              }`}>
+                              {task.checked && <CheckCircle2 className="w-3 h-3 text-white" />}
+                            </div>
+                            <span className={`text-sm ${task.checked ? 'text-slate-900 font-medium' : 'text-slate-400'}`}>
+                              {task.label}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Plugin Update List */}
+                    {reportData.pluginUpdateList.trim() && (
+                      <div className="mb-6">
+                        <h2 className="text-lg font-bold text-slate-800 mb-3">更新したプラグイン</h2>
+                        <div className="bg-slate-50 rounded-lg p-4">
+                          <ul className="space-y-1">
+                            {reportData.pluginUpdateList.split('\n').filter(line => line.trim()).map((plugin, index) => (
+                              <li key={index} className="flex items-center gap-2 text-sm text-slate-700 pdf-keep">
+                                <span className="w-4 h-4 rounded-full bg-green-500 flex items-center justify-center flex-shrink-0">
+                                  <CheckCircle2 className="w-3 h-3 text-white" />
+                                </span>
+                                <span className="leading-none pt-[1px]">{plugin.trim()}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Backup File Name */}
+                    {reportData.backupFileName && (
+                      <div className="mb-6">
+                        <h2 className="text-lg font-bold text-slate-800 mb-3">バックアップ情報</h2>
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                          <p className="text-sm text-slate-600 mb-1">バックアップファイル名</p>
+                          <p className="text-lg font-mono font-medium text-blue-800">{reportData.backupFileName}</p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Analytics Report */}
+                    {(reportData.analyticsSummary || reportData.analyticsImage || reportData.claritySummary || reportData.clarityImage) && (
+                      <div className="mb-6">
+                        <h2 className="text-lg font-bold text-slate-800 mb-3">解析レポート</h2>
+
+                        {/* Google Analytics */}
+                        {(reportData.analyticsSummary || reportData.analyticsImage) && (
+                          <div className="mb-4">
+                            <h3 className="text-sm font-semibold text-slate-700 mb-2">Google Analytics</h3>
+                            {reportData.analyticsImage && (
+                              <div className="border rounded-lg overflow-hidden mb-2 bg-slate-50 flex justify-center">
+                                <img
+                                  src={reportData.analyticsImage.dataUrl}
+                                  alt="Google Analytics"
+                                  className="max-w-full object-contain"
+                                  style={{ maxHeight: '400px' }}
+                                />
+                              </div>
+                            )}
+                            {reportData.analyticsSummary && (
+                              <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
+                                {reportData.analyticsSummary}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Microsoft Clarity */}
+                        {(reportData.claritySummary || reportData.clarityImage) && (
+                          <div>
+                            <h3 className="text-sm font-semibold text-slate-700 mb-2">Microsoft Clarity</h3>
+                            {reportData.clarityImage && (
+                              <div className="border rounded-lg overflow-hidden mb-2 bg-slate-50 flex justify-center">
+                                <img
+                                  src={reportData.clarityImage.dataUrl}
+                                  alt="Microsoft Clarity"
+                                  className="max-w-full object-contain"
+                                  style={{ maxHeight: '400px' }}
+                                />
+                              </div>
+                            )}
+                            {reportData.claritySummary && (
+                              <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
+                                {reportData.claritySummary}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Comments */}
+                    {reportData.comment && (
+                      <div className="mb-6">
+                        <h2 className="text-lg font-bold text-slate-800 mb-3">コメント</h2>
+                        <div className="bg-slate-50 rounded-lg p-4 whitespace-pre-wrap text-sm text-slate-700">
+                          {reportData.comment}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Footer */}
+                    <div className="mt-8 pt-6 border-t border-slate-200">
+                      <div className="flex justify-between items-end">
+                        <div>
+                          <p className="text-sm text-slate-500 mb-2">
+                            本報告書はWordPressメンテナンスの実施内容を報告するものです。
+                          </p>
+                          <p className="text-xs text-slate-400">
+                            Generated by WP Maintenance Report Generator
+                          </p>
+                        </div>
+                        <div className="text-right flex items-center gap-3">
+                          <div>
+                            <p className="text-sm font-bold text-slate-800">AVII IMAGE WORKS</p>
+                            <p className="text-xs text-slate-500">WordPress Maintenance Service</p>
+                          </div>
+                          <img
+                            src="/logo.png"
+                            alt="AVII IMAGE WORKS"
+                            className="w-10 h-10 object-contain"
+                          />
+                        </div>
                       </div>
                     </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
       </main>
     </div>
